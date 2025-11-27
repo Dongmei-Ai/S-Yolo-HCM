@@ -13,10 +13,10 @@ from public_config import yolo_yaml, yolo_pth, dataset_yaml
 # model = YOLO("yolo11n.yaml")  # build a new model from YAML
 # model = YOLO("yolo11n.pt")  # load a pretrained model (recommended for training)
 yolo_model = YOLO(yolo_yaml)  # build from YAML and transfer weights
-model = yolo_model.load(yolo_pth)
+yolo_model = yolo_model.load(yolo_pth)
 # debug了半天，发现是 /server/developer/zhou/yolo/ultralytics-main/ultralytics/cfg/models/11/yolo11.yaml
 # Train the model
-results = model.train(data=dataset_yaml, epochs=100, imgsz=640)
+results = yolo_model.train(data=dataset_yaml, epochs=100, imgsz=640)
 
 
 
