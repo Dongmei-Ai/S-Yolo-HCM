@@ -1,0 +1,12 @@
+模型部分还不用动
+看下数据是怎么自动下的
+模型是怎么处理的
+数据处理应该在 ultralytics/engine/trainer.py
+按这个代码数据目录在/server/developer/zhou/yolo/datasets/coco8
+
+
+# 前处理部分等
+
+相关的配置文件是default_cfg_yaml
+有一个 ultralytics/data/build.py 里面有一个 build_yolo_dataset 是核心
+数据增强相关的内容全部都在ultralytics/data/dataset.py的build_transforms之中

@@ -17,3 +17,6 @@ model = yolo_model.load(yolo_pth)
 # debug了半天，发现是 /server/developer/zhou/yolo/ultralytics-main/ultralytics/cfg/models/11/yolo11.yaml
 # Train the model
 results = model.train(data=dataset_yaml, epochs=100, imgsz=640)
+
+
+

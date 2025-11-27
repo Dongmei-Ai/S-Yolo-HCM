@@ -318,12 +318,14 @@ class BaseTrainer:
         if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
             self.args.batch = self.batch_size = self.auto_batch()
 
+        # ultralytics/models/yolo/detect/train.py
         # Dataloaders
         batch_size = self.batch_size // max(self.world_size, 1)
         self.train_loader = self.get_dataloader(
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
         )
         # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
+        
         self.test_loader = self.get_dataloader(
             self.data.get("val") or self.data.get("test"),
             batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
