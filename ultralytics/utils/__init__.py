@@ -29,6 +29,8 @@ from ultralytics.utils.git import GitRepo
 from ultralytics.utils.patches import imread, imshow, imwrite, torch_save  # for patches
 from ultralytics.utils.tqdm import TQDM  # noqa
 
+from public_config import default_cfg_yaml
+
 # PyTorch Multi-GPU DDP Constants
 RANK = int(os.getenv("RANK", -1))
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
@@ -39,7 +41,7 @@ FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO
 ASSETS = ROOT / "assets"  # default images
 ASSETS_URL = "https://github.com/ultralytics/assets/releases/download/v0.0.0"  # assets GitHub URL
-DEFAULT_CFG_PATH = ROOT / "cfg/default.yaml"
+DEFAULT_CFG_PATH = ROOT / default_cfg_yaml
 NUM_THREADS = min(8, max(1, os.cpu_count() - 1))  # number of YOLO multiprocessing threads
 AUTOINSTALL = str(os.getenv("YOLO_AUTOINSTALL", True)).lower() == "true"  # global auto-install mode
 VERBOSE = str(os.getenv("YOLO_VERBOSE", True)).lower() == "true"  # global verbose mode
