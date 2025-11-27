@@ -6,7 +6,14 @@
 
 
 # 前处理部分等
-
 相关的配置文件是default_cfg_yaml
 有一个 ultralytics/data/build.py 里面有一个 build_yolo_dataset 是核心
 数据增强相关的内容全部都在ultralytics/data/dataset.py的build_transforms之中
+
+
+# 损失计算部分
+损失查关键字loss, self.loss_items = self.model(batch)
+
+
+# 后处理部分
+后处理部分的在哪里 def postprocess(self, preds, img, orig_imgs, **kwargs): 关键词类似
