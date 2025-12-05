@@ -32,6 +32,7 @@ __all__ = (
     "Bottleneck",
     "BottleneckCSP",
     "C2f",
+    "C2fDWR",
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
@@ -314,6 +315,47 @@ class C2f(nn.Module):
         return self.cv2(torch.cat(y, 1))
 
 
+class C2fDWR(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+        """Initialize a CSP bottleneck with 2 convolutions.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(
+            BottleneckDWR(
+                self.c, 
+                self.c, 
+                shortcut, 
+                g, 
+                k=((3, 3), (3, 3), (3, 3), (3, 3), (1, 1)), 
+                e=1.0) for _ in range(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using split() instead of chunk()."""
+        y = self.cv1(x).split((self.c, self.c), 1)
+        y = [y[0], y[1]]
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+ 
+
 class C3(nn.Module):
     """CSP Bottleneck with 3 convolutions."""
 
@@ -448,6 +490,60 @@ class GhostBottleneck(nn.Module):
         """Apply skip connection and concatenation to input tensor."""
         return self.conv(x) + self.shortcut(x)
 
+class BottleneckDWR(nn.Module):
+    """Standard bottleneck."""
+
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
+    ):
+        """Initialize a standard bottleneck module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            g (int): Groups for convolutions.
+            k (tuple): Kernel sizes for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        # self.cv2 = Conv(c_, c2, k[0], 1, g=g)
+        # 我们必须保证是整除
+        c_div = c_ // 3
+        if c_ > c_div*3:
+            c_1 = c_div+1
+            c_2 = c_div+1
+        else:
+            c_1 = c_div
+            c_2 = c_div
+        c_3 = c_ - c_1 - c_2
+        self.dcv3 = DWConv(c_1, c_1, k[1], 1, d=1, act=False)
+        self.dcv4 = DWConv(c_2, c_2, k[2], 1, d=3, act=False)
+        self.dcv5 = DWConv(c_3, c_3, k[3], 1, d=5, act=False)
+        self.cv6 = Conv(c1, c_, k[4], 1, act=False)
+        # self.cv6 = Conv(c1, c_, k[4], 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bottleneck with optional shortcut connection."""
+        x1 = self.cv1(x)
+ # 将 x1 在通道维度上平均分成三份
+        x1_parts = torch.chunk(x1, 3, dim=1)
+        
+        # 分别通过三个不同的深度可分离卷积
+        x2 = self.dcv3(x1_parts[0])
+        x3 = self.dcv4(x1_parts[1])
+        x4 = self.dcv5(x1_parts[2])
+         # 在通道维度上拼接结果
+        combined = torch.cat([x2, x3, x4], dim=1)
+        
+        # 通过最终的卷积层
+        output = self.cv6(combined)
+        
+        # 应用 shortcut 连接
+        return x + output if self.add else output
 
 class Bottleneck(nn.Module):
     """Standard bottleneck."""
