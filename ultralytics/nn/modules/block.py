@@ -33,6 +33,7 @@ __all__ = (
     "BottleneckCSP",
     "C2f",
     "C2fDWR",
+    "C2fPKI",
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
@@ -354,7 +355,48 @@ class C2fDWR(nn.Module):
         y = [y[0], y[1]]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
- 
+
+class C2fPKI(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+        """Initialize a CSP bottleneck with 2 convolutions.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(
+            PKIBlock(
+                self.c, 
+                self.c, 
+                shortcut, 
+                g, 
+                k=((3, 3), (5, 5), (7, 7), (9, 9), (11, 11), (1, 1)), 
+                k2=((1, 1),(1, 11), (11, 1), (1, 1)),
+                e=1.0) for _ in range(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using split() instead of chunk()."""
+        y = self.cv1(x).split((self.c, self.c), 1)
+        y = [y[0], y[1]]
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
 
 class C3(nn.Module):
     """CSP Bottleneck with 3 convolutions."""
@@ -544,6 +586,117 @@ class BottleneckDWR(nn.Module):
         
         # 应用 shortcut 连接
         return x + output if self.add else output
+
+class CAAModule(nn.Module):
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
+    ):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.avg1 = nn.AvgPool2d(kernel_size=7, padding=3, stride=1)
+        self.cv2 = Conv(c1, c_, k[0], 1)
+        self.dcv3 = DWConv(c1, c_, k[1], 1, d=1, act=False)
+        self.dc4 = DWConv(c1, c_, k[2], 1, d=1, act=False)
+        self.cv5 = Conv(c1, c_, k[3], 1)
+        self.act = nn.Sigmoid()
+
+
+    def __call__(self, x):
+        avg1 = self.avg1(x)
+        cv2 = self.cv2(avg1)
+        dcv3 = self.dcv3(cv2)
+        dc4 = self.dc4(dcv3)
+        result = self.act(dc4)
+        return result
+
+class PKIModule(nn.Module):
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
+    ):
+        """Initialize a standard bottleneck module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            g (int): Groups for convolutions.
+            k (tuple): Kernel sizes for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.dcv1 = DWConv(c1, c_, k[0], 1, d=1)
+        # self.cv2 = Conv(c_, c2, k[0], 1, g=g)
+        # 我们必须保证是整除
+        # c_div = c_ // 4
+        self.dcv3 = DWConv(c1, c_, k[1], 1, d=1)
+        self.dcv4 = DWConv(c1, c_, k[2], 1, d=1)
+        self.dcv5 = DWConv(c1, c_, k[3], 1, d=1)
+        self.dcv6 = DWConv(c1, c_, k[4], 1, d=1)
+        self.cv7 = Conv(c1, c_, k[5], 1)
+        # self.cv6 = Conv(c1, c_, k[4], 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bottleneck with optional shortcut connection."""
+        x1 = self.dcv1(x)
+ # 将 x1 在通道维度上平均分成三份
+        # x1_parts = torch.chunk(x1, 3, dim=1)
+        
+        # 分别通过三个不同的深度可分离卷积
+        x2 = self.dcv3(x1)
+        x3 = self.dcv4(x1)
+        x4 = self.dcv5(x1)
+        x5 = self.dcv6(x1)
+        x6 = x2+x3+x4+x5
+        
+        # 通过最终的卷积层
+        output = self.cv7(x6)
+        
+        # 应用 shortcut 连接
+        return output
+
+class PKIBlock(nn.Module):
+    """Standard bottleneck."""
+
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), k2: tuple[int, int] = (3, 3), e: float = 0.5
+    ):
+        """Initialize a standard bottleneck module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            g (int): Groups for convolutions.
+            k (tuple): Kernel sizes for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        c_ = int(c2 * e)
+        self.pki_module = PKIModule(c1, 
+                                    c2, 
+                                    shortcut, 
+                                    g, 
+                                    k, 
+                                    e)
+
+        self.caa_module = CAAModule(c1, 
+                                    c2, 
+                                    shortcut, 
+                                    g, 
+                                    k2, 
+                                    e)
+        self.cv3 = Conv(c1, c_, k[5], 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bottleneck with optional shortcut connection."""
+        pki = self.pki_module(x)
+        caa = self.caa_module(x)
+        x2 = pki + pki * caa
+        result = self.cv3(x2)
+        # 应用 shortcut 连接
+        return result
 
 class Bottleneck(nn.Module):
     """Standard bottleneck."""
