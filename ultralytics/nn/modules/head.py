@@ -16,7 +16,7 @@ from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
-from .conv import Conv, DWConv
+from .conv import Conv, DWConv, PConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
@@ -211,6 +211,87 @@ class Detect(nn.Module):
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
+class DetectPDE(Detect):
+    """YOLO PDE detection head for detection with PDE models.
+
+    This class extends the Detect head to include PDE prediction capabilities for detection tasks.
+    It uses a shared PConv (Partial Convolution) layer that processes input features first,
+    then branches into different convolutions for box regression and classification.
+
+    Structure: Input -> Shared PConv -> [cv2 branch | cv3 branch] -> Output
+
+    Attributes:
+        nc (int): Number of classes.
+        ch (tuple): Tuple of channel sizes from backbone feature maps.
+        shared_pconv (nn.ModuleList): Shared PConv layers applied before branching.
+        cv2_conv1 (nn.ModuleList): First convolution layers for box regression branch.
+        cv2_conv2 (nn.ModuleList): Second convolution layers for box regression branch.
+        cv2_conv3 (nn.ModuleList): Final convolution layers for box regression.
+        cv3_conv1 (nn.ModuleList): First convolution layers for classification branch.
+        cv3_conv2 (nn.ModuleList): Second convolution layers for classification branch.
+        cv3_conv3 (nn.ModuleList): Final convolution layers for classification.
+    """
+    def __init__(self, nc: int = 80, ch: tuple = ()):
+        super().__init__(nc, ch)
+        # Create shared PConv layer - all branches share this first
+        c_shared = max((16, ch[0] // 4, self.reg_max * 4))
+        self.shared_pconv = nn.ModuleList(
+            PConv(x, c_shared, k=3, s=1, p=1, act=True, p_ratio=0.25) for x in ch
+        )
+        
+        # Box regression branch (cv2): after shared PConv, use different convolutions
+        c2 = max((16, ch[0] // 4, self.reg_max * 4))
+        self.cv2_conv1 = nn.ModuleList(Conv(c_shared, c2, 3) for _ in ch)
+        self.cv2_conv2 = nn.ModuleList(Conv(c2, c2, 3) for _ in ch)
+        # Direct connection from shared PConv, so input channels should be c_shared
+        self.cv2_conv3 = nn.ModuleList(nn.Conv2d(c_shared, 4 * self.reg_max, 1) for _ in ch)
+        
+        # Classification branch (cv3): after shared PConv, use different convolutions
+        c3 = max(ch[0], min(self.nc, 100))
+        if self.legacy:
+            self.cv3_conv1 = nn.ModuleList(Conv(c_shared, c3, 3) for _ in ch)
+            self.cv3_conv2 = nn.ModuleList(Conv(c3, c3, 3) for _ in ch)
+            # Direct connection from shared PConv, so input channels should be c_shared
+            self.cv3_conv3 = nn.ModuleList(nn.Conv2d(c_shared, self.nc, 1) for _ in ch)
+        else:
+            self.cv3_conv1 = nn.ModuleList(Conv(c_shared, c3, 1) for _ in ch)
+            self.cv3_dw = nn.ModuleList(DWConv(c3, c3, 3) for _ in ch)
+            self.cv3_conv2 = nn.ModuleList(Conv(c3, c3, 1) for _ in ch)
+            # Direct connection from shared PConv, so input channels should be c_shared
+            self.cv3_conv3 = nn.ModuleList(nn.Conv2d(c_shared, self.nc, 1) for _ in ch)
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
+        """Concatenate and return predicted bounding boxes and class probabilities."""
+        if self.end2end:
+            return self.forward_end2end(x)
+
+        # Process each detection layer: shared PConv first, then branch to cv2 and cv3
+        for i in range(self.nl):
+            # Apply shared PConv first
+            x_shared = self.shared_pconv[i](x[i])
+            
+            # Box regression branch: shared PConv -> Conv -> Conv -> Conv2d
+            # x_box = self.cv2_conv1[i](x_shared)
+            # x_box = self.cv2_conv2[i](x_box)
+            x_box = self.cv2_conv3[i](x_shared)
+            
+            # Classification branch: shared PConv -> Conv -> (DWConv ->) Conv -> Conv2d
+            if self.legacy:
+                # x_cls = self.cv3_conv1[i](x_shared)
+                # x_cls = self.cv3_conv2[i](x_cls)
+                x_cls = self.cv3_conv3[i](x_shared)
+            else:
+                # x_cls = self.cv3_conv1[i](x_shared)
+                # x_cls = self.cv3_dw[i](x_cls)
+                # x_cls = self.cv3_conv2[i](x_cls)
+                x_cls = self.cv3_conv3[i](x_shared)
+            
+            x[i] = torch.cat((x_box, x_cls), 1)
+        
+        if self.training:  # Training path
+            return x
+        y = self._inference(x)
+        return y if self.export else (y, x)
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.

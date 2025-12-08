@@ -22,6 +22,7 @@ __all__ = (
     "GhostConv",
     "Index",
     "LightConv",
+    "PConv",
     "RepConv",
     "SpatialAttention",
 )
@@ -258,6 +259,75 @@ class LightConv(nn.Module):
             (torch.Tensor): Output tensor.
         """
         return self.conv2(self.conv1(x))
+
+
+class PConv(nn.Module):
+    """Partial Convolution (PConv) module as shared convolution layer.
+
+    PConv processes only a portion of input channels, reducing computational cost.
+    This module can be shared across multiple branches to replace multiple Conv layers.
+
+    Attributes:
+        conv (nn.Conv2d): Convolutional layer for partial channels.
+        bn (nn.BatchNorm2d): Batch normalization layer.
+        act (nn.Module): Activation function layer.
+        default_act (nn.Module): Default activation function (SiLU).
+        partial_c (int): Number of channels to process.
+    """
+
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, p_ratio=0.25):
+        """Initialize PConv layer with given parameters.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            k (int): Kernel size.
+            s (int): Stride.
+            p (int, optional): Padding.
+            g (int): Groups.
+            d (int): Dilation.
+            act (bool | nn.Module): Activation function.
+            p_ratio (float): Ratio of channels to process (default: 0.25).
+        """
+        super().__init__()
+        self.p_ratio = p_ratio
+        self.c1 = c1
+        self.c2 = c2
+        self.partial_c = max(1, int(c1 * p_ratio))  # Number of channels to process
+        
+        p = autopad(k, p, d)
+        self.conv = nn.Conv2d(self.partial_c, c2, k, s, p, groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x):
+        """Apply partial convolution to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor with shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor with shape (B, c2, H', W').
+        """
+        # Extract partial channels for convolution
+        x_partial = x[:, :self.partial_c, :, :]
+        
+        # Process partial channels through convolution
+        return self.act(self.bn(self.conv(x_partial)))
+
+    def forward_fuse(self, x):
+        """Apply partial convolution without batch normalization.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        x_partial = x[:, :self.partial_c, :, :]
+        return self.act(self.conv(x_partial))
 
 
 class DWConv(Conv):
