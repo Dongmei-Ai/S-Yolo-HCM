@@ -89,84 +89,44 @@ class Conv(nn.Module):
         """
         return self.act(self.conv(x))
 
-# class DConv(nn.Module):
-#     """Depthwise Separable Convolution module.
-    
-#     Depthwise separable convolution consists of two parts:
-#     1. Depthwise convolution: Each input channel is convolved separately.
-#     2. Pointwise convolution: 1x1 convolution to combine the depthwise outputs.
-    
-#     Attributes:
-#         depthwise (nn.Conv2d): Depthwise convolutional layer.
-#         pointwise (nn.Conv2d): Pointwise convolutional layer (1x1).
-#         bn1 (nn.BatchNorm2d): Batch normalization for depthwise convolution.
-#         bn2 (nn.BatchNorm2d): Batch normalization for pointwise convolution.
-#         act (nn.Module): Activation function layer.
-#         default_act (nn.Module): Default activation function (SiLU).
-#     """
-    
-#     default_act = nn.SiLU()  # default activation
+class ConvOnly(nn.Module):
+    """Standard convolution module with batch normalization and activation.
 
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         """Initialize Depthwise Separable Convolution layer.
-        
-#         Args:
-#             c1 (int): Number of input channels.
-#             c2 (int): Number of output channels.
-#             k (int): Kernel size for depthwise convolution.
-#             s (int): Stride.
-#             p (int, optional): Padding.
-#             g (int): Groups. For depthwise convolution, this should be c1.
-#             d (int): Dilation.
-#             act (bool | nn.Module): Activation function.
-#         """
-#         super().__init__()
-        
-#         # Ensure proper grouping for depthwise convolution
-#         if g == 1:
-#             g = c1  # For depthwise convolution, groups should equal input channels
-        
-#         # Depthwise convolution
-#         self.depthwise = nn.Conv2d(
-#             c1, c1, k, s, autopad(k, p, d), 
-#             groups=g, dilation=d, bias=False
-#         )
-#         self.bn1 = nn.BatchNorm2d(c1)
-        
-#         # Pointwise convolution (1x1 convolution)
-#         self.pointwise = nn.Conv2d(c1, c2, 1, 1, 0, bias=False)
-#         self.bn2 = nn.BatchNorm2d(c2)
-        
-#         # Activation function
-#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+    Attributes:
+        conv (nn.Conv2d): Convolutional layer.
+        bn (nn.BatchNorm2d): Batch normalization layer.
+        act (nn.Module): Activation function layer.
+        default_act (nn.Module): Default activation function (SiLU).
+    """
 
-#     def forward(self, x):
-#         """Apply depthwise separable convolution to input tensor.
-        
-#         Args:
-#             x (torch.Tensor): Input tensor.
-            
-#         Returns:
-#             (torch.Tensor): Output tensor.
-#         """
-#         # Depthwise convolution -> BN -> Activation
-#         x = self.act(self.bn1(self.depthwise(x)))
-#         # Pointwise convolution -> BN -> Activation
-#         return self.act(self.bn2(self.pointwise(x)))
+    # default_act = nn.SiLU()  # default activation
 
-#     def forward_fuse(self, x):
-#         """Apply depthwise separable convolution without batch normalization.
-        
-#         Args:
-#             x (torch.Tensor): Input tensor.
-            
-#         Returns:
-#             (torch.Tensor): Output tensor.
-#         """
-#         # Depthwise convolution -> Activation
-#         x = self.act(self.depthwise(x))
-#         # Pointwise convolution -> Activation
-#         return self.act(self.pointwise(x))
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """Initialize Conv layer with given parameters.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            k (int): Kernel size.
+            s (int): Stride.
+            p (int, optional): Padding.
+            g (int): Groups.
+            d (int): Dilation.
+            act (bool | nn.Module): Activation function.
+        """
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+
+    def forward(self, x):
+        """Apply convolution, batch normalization and activation to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.conv(x)
 
 class Conv2(Conv):
     """Simplified RepConv module with Conv fusing.
@@ -331,6 +291,22 @@ class PConv(nn.Module):
 
 
 class DWConv(Conv):
+    """Depth-wise convolution module."""
+
+    def __init__(self, c1, c2, k=1, s=1, d=1, act=True):
+        """Initialize depth-wise convolution with given parameters.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            k (int): Kernel size.
+            s (int): Stride.
+            d (int): Dilation.
+            act (bool | nn.Module): Activation function.
+        """
+        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
+
+class DWConvOnly(ConvOnly):
     """Depth-wise convolution module."""
 
     def __init__(self, c1, c2, k=1, s=1, d=1, act=True):

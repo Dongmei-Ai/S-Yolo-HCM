@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from .conv import Conv, DWConv, DWConvOnly, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -561,11 +561,11 @@ class BottleneckDWR(nn.Module):
             c_1 = c_div
             c_2 = c_div
         c_3 = c_ - c_1 - c_2
-        self.dcv3 = DWConv(c_1, c_1, k[1], 1, d=1, act=False)
-        self.dcv4 = DWConv(c_2, c_2, k[2], 1, d=3, act=False)
-        self.dcv5 = DWConv(c_3, c_3, k[3], 1, d=5, act=False)
-        self.bn = nn.BatchNorm2d(c2)
-        self.cv6 = Conv(c1, c_, k[4], 1, act=False)
+        self.dcv3 = DWConvOnly(c_1, c_1, k[1], 1, d=1, act=False)
+        self.dcv4 = DWConvOnly(c_2, c_2, k[2], 1, d=3, act=False)
+        self.dcv5 = DWConvOnly(c_3, c_3, k[3], 1, d=5, act=False)
+        self.bn = nn.BatchNorm2d(c_)  # 修复：应该是 c_ 而不是 c2
+        self.cv6 = Conv(c_, c2, k[4], 1, act=False)  # 修复：输入应该是 c_，输出应该是 c2
         # self.cv6 = Conv(c1, c_, k[4], 1)
         self.add = shortcut and c1 == c2
 
@@ -576,9 +576,9 @@ class BottleneckDWR(nn.Module):
         x1_parts = torch.chunk(x1, 3, dim=1)
         
         # 分别通过三个不同的深度可分离卷积
-        x2 = self.dcv3.forward_fuse(x1_parts[0])
-        x3 = self.dcv4.forward_fuse(x1_parts[1])
-        x4 = self.dcv5.forward_fuse(x1_parts[2])
+        x2 = self.dcv3(x1_parts[0])
+        x3 = self.dcv4(x1_parts[1])
+        x4 = self.dcv5(x1_parts[2])
          # 在通道维度上拼接结果
         combined = torch.cat([x2, x3, x4], dim=1)
         bn = self.bn(combined)
