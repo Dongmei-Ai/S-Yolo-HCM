@@ -17,3 +17,5 @@
 
 # 后处理部分
 后处理部分的在哪里 def postprocess(self, preds, img, orig_imgs, **kwargs): 关键词类似
+
+NEU数据集需降低学习率，COCO及VOC都是0.01的
