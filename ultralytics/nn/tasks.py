@@ -390,6 +390,10 @@ class DetectionModel(BaseModel):
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
+        if "loss" in self.yaml:
+            self.loss_type = self.yaml["loss"]["iou_type"]
+        else:
+            self.loss_type = "iou"
 
         # Build strides
         m = self.model[-1]  # Detect()
@@ -484,7 +488,7 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        return E2EDetectLoss(self, loss_type=self.loss_type) if getattr(self, "end2end", False) else v8DetectionLoss(self, loss_type=self.loss_type)
 
 
 class OBBModel(DetectionModel):

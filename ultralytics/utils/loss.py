@@ -139,6 +139,273 @@ class BboxLoss(nn.Module):
         return loss_iou, loss_dfl
 
 
+def bbox_wiou(
+    box1: torch.Tensor,
+    box2: torch.Tensor,
+    xywh: bool = False,
+    eps: float = 1e-7,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Calculate Wise-IoU (WIoU) between bounding boxes.
+    
+    Args:
+        box1 (torch.Tensor): Predicted bounding boxes, shape (N, 4) in xyxy format.
+        box2 (torch.Tensor): Ground truth bounding boxes, shape (N, 4) in xyxy format.
+        xywh (bool): If True, input boxes are in (x, y, w, h) format. If False, in (x1, y1, x2, y2) format.
+        eps (float): Small value to avoid division by zero.
+    
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (IoU values, R_WIoU distance metric)
+    """
+    # Get coordinates
+    if xywh:
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+        w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
+        b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
+        b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    
+    # Intersection area
+    inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp_(0) * (
+        b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)
+    ).clamp_(0)
+    
+    # Union area
+    union = w1 * h1 + w2 * h2 - inter + eps
+    
+    # IoU
+    iou = inter / union
+    
+    # Calculate center points
+    cx1 = (b1_x1 + b1_x2) / 2
+    cy1 = (b1_y1 + b1_y2) / 2
+    cx2 = (b2_x1 + b2_x2) / 2
+    cy2 = (b2_y1 + b2_y2) / 2
+    
+    # Calculate minimum enclosing box (convex box)
+    cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex width
+    ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
+    
+    # R_WIoU: distance metric
+    center_distance_sq = (cx1 - cx2).pow(2) + (cy1 - cy2).pow(2)
+    convex_diagonal_sq = cw.pow(2) + ch.pow(2) + eps
+    r_wiou = (center_distance_sq / convex_diagonal_sq).exp()
+    
+    return iou, r_wiou
+
+
+class BboxWiouLossV1(BboxLoss):
+    """Wise-IoU Loss v1: 基于距离的注意力机制.
+    
+    WIoUv1 引入了基于距离的注意力机制，通过对预测框和真实框之间的距离进行加权，
+    提升模型的泛化能力。
+    
+    References:
+        https://arxiv.org/abs/2301.10051
+    """
+    
+    def __init__(self, reg_max: int = 16):
+        """Initialize the BboxWiouLossV1 module."""
+        super().__init__(reg_max)
+    
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute WIoUv1 and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate WIoU
+        iou, r_wiou = bbox_wiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+        
+        # WIoUv1: L_WIoUv1 = R_WIoU * L_IoU
+        loss_iou = (r_wiou * (1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+        
+        return loss_iou, loss_dfl
+
+
+class BboxWiouLossV2(BboxLoss):
+    """Wise-IoU Loss v2: 单调聚焦机制.
+    
+    WIoUv2 在 WIoUv1 的基础上，引入了类似 Focal Loss 的单调聚焦机制，
+    降低易分类样本对总损失的影响，使模型更关注难分类样本。
+    
+    References:
+        https://arxiv.org/abs/2301.10051
+    """
+    
+    def __init__(self, reg_max: int = 16, gamma: float = 1.5):
+        """Initialize the BboxWiouLossV2 module.
+        
+        Args:
+            reg_max: Maximum value for distribution focal loss.
+            gamma: Focusing parameter for monotonic focusing mechanism.
+        """
+        super().__init__(reg_max)
+        self.gamma = gamma
+        # Moving average of IoU loss
+        self.register_buffer('iou_loss_avg', torch.tensor(1.0))
+        self.momentum = 0.9
+    
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute WIoUv2 and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate WIoU
+        iou, r_wiou = bbox_wiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+        loss_iou_base = 1.0 - iou  # L_IoU*
+        
+        # Update moving average
+        with torch.no_grad():
+            self.iou_loss_avg = self.momentum * self.iou_loss_avg + (1 - self.momentum) * loss_iou_base.mean()
+        
+        # Normalized IoU loss
+        loss_iou_normalized = loss_iou_base / (self.iou_loss_avg + 1e-7)
+        
+        # WIoUv2: L_WIoUv2 = (L_IoU* / L_IoU_avg)^gamma * L_WIoUv1
+        loss_iou_v1 = r_wiou * loss_iou_base
+        loss_iou = (loss_iou_normalized.pow(self.gamma) * loss_iou_v1 * weight).sum() / target_scores_sum
+        
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+        
+        return loss_iou, loss_dfl
+
+
+class BboxWiouLossV3(BboxLoss):
+    """Wise-IoU Loss v3: 非单调聚焦机制.
+    
+    WIoUv3 引入了非单调聚焦机制，通过定义异常度系数来衡量锚框的质量，
+    并构建非单调聚焦因子应用于 WIoUv1，使模型更关注中等质量的样本。
+    
+    References:
+        https://arxiv.org/abs/2301.10051
+    """
+    
+    def __init__(self, reg_max: int = 16, alpha: float = 1.0, delta: float = 1.6):
+        """Initialize the BboxWiouLossV3 module.
+        
+        Args:
+            reg_max: Maximum value for distribution focal loss.
+            alpha: Hyperparameter for non-monotonic focusing mechanism.
+            delta: Hyperparameter for non-monotonic focusing mechanism.
+        """
+        super().__init__(reg_max)
+        self.alpha = alpha
+        self.delta = delta
+        # Moving average of IoU loss
+        self.register_buffer('iou_loss_avg', torch.tensor(1.0))
+        self.momentum = 0.9
+    
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute WIoUv3 and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate WIoU
+        iou, r_wiou = bbox_wiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+        loss_iou_base = 1.0 - iou  # L_IoU*
+        
+        # Update moving average
+        with torch.no_grad():
+            self.iou_loss_avg = self.momentum * self.iou_loss_avg + (1 - self.momentum) * loss_iou_base.mean()
+        
+        # Anomaly coefficient: beta = L_IoU* / L_IoU_avg
+        beta = loss_iou_base / (self.iou_loss_avg + 1e-7)
+        
+        # Non-monotonic focusing factor: r = beta / (delta * alpha^(beta - delta))
+        r = beta / (self.delta * self.alpha.pow(beta - self.delta) + 1e-7)
+        
+        # WIoUv3: L_WIoUv3 = r * L_WIoUv1
+        loss_iou_v1 = r_wiou * loss_iou_base
+        loss_iou = (r * loss_iou_v1 * weight).sum() / target_scores_sum
+        
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+        
+        return loss_iou, loss_dfl
+
+
+class BboxWiouLoss(BboxLoss):
+    """Criterion class for computing training losses for bounding boxes.
+    
+    默认使用 WIoUv1 实现。如需使用 v2 或 v3，请直接使用 BboxWiouLossV2 或 BboxWiouLossV3。
+    """
+    
+    def __init__(self, reg_max: int = 16):
+        """Initialize the BboxWiouLoss module with regularization maximum and DFL settings."""
+        super().__init__(reg_max)
+    
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute Wiou and DFL losses for bounding boxes."""
+        # 默认使用 WIoUv1
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou, r_wiou = bbox_wiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+        loss_iou = (r_wiou * (1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+        
+        return loss_iou, loss_dfl
+
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses for rotated bounding boxes."""
 
@@ -194,7 +461,7 @@ class KeypointLoss(nn.Module):
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
-    def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
+    def __init__(self, model, tal_topk: int = 10, loss_type: str = "iou"):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -211,7 +478,18 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        if loss_type == "Iou":
+            self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        elif loss_type == "WiouV1":
+            self.bbox_loss = BboxWiouLoss(m.reg_max).to(device)
+        elif loss_type == "WiouV2":
+            self.bbox_loss = BboxWiouLossV2(m.reg_max).to(device)
+        elif loss_type == "WiouV3":
+            self.bbox_loss = BboxWiouLossV3(m.reg_max).to(device)
+        else:
+            print("iou old")
+            self.bbox_loss = BboxLoss(m.reg_max).to(device)
+            exit()
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -774,7 +1052,7 @@ class v8OBBLoss(v8DetectionLoss):
 class E2EDetectLoss:
     """Criterion class for computing training losses for end-to-end detection."""
 
-    def __init__(self, model):
+    def __init__(self, model, loss_type):
         """Initialize E2EDetectLoss with one-to-many and one-to-one detection losses using the provided model."""
         self.one2many = v8DetectionLoss(model, tal_topk=10)
         self.one2one = v8DetectionLoss(model, tal_topk=1)
