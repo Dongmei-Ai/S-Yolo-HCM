@@ -704,6 +704,89 @@ class SpatialAttention(nn.Module):
         return x * self.act(self.cv1(torch.cat([torch.mean(x, 1, keepdim=True), torch.max(x, 1, keepdim=True)[0]], 1)))
 
 
+class CoordinateAttention(nn.Module):
+    """Coordinate Attention (CA) module.
+
+    Coordinate Attention embeds positional information into channel attention, enabling the module to
+    capture long-range dependencies with precise positional information. It decomposes channel attention
+    into two parallel 1D feature encoding processes that aggregate features along the two spatial directions.
+
+    Attributes:
+        reduction (int): Reduction ratio for intermediate channels.
+        pool_h (nn.AdaptiveAvgPool2d): Horizontal direction pooling.
+        pool_w (nn.AdaptiveAvgPool2d): Vertical direction pooling.
+        mip (nn.Conv2d): Shared 1x1 convolution for feature encoding.
+        conv_h (nn.Conv2d): Horizontal attention convolution.
+        conv_w (nn.Conv2d): Vertical attention convolution.
+        act (nn.Sigmoid): Sigmoid activation for attention weights.
+
+    References:
+        https://arxiv.org/abs/2103.02907
+    """
+
+    def __init__(self, c1, reduction=32):
+        """Initialize Coordinate Attention module.
+
+        Args:
+            c1 (int): Number of input channels.
+            reduction (int): Reduction ratio for intermediate channels. Default is 32.
+        """
+        super().__init__()
+        c_ = max(8, c1 // reduction)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))  # Pool along height dimension
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))  # Pool along width dimension
+        
+        # Shared 1x1 convolution
+        self.mip = nn.Conv2d(c1, c_, kernel_size=1, stride=1, padding=0)
+        self.bn = nn.BatchNorm2d(c_)
+        self.act = nn.ReLU(inplace=True)
+        
+        # Separate convolutions for horizontal and vertical attention
+        self.conv_h = nn.Conv2d(c_, c1, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(c_, c1, kernel_size=1, stride=1, padding=0)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply coordinate attention to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor): Coordinate-attended output tensor of shape (B, C, H, W).
+        """
+        identity = x
+        n, c, h, w = x.size()
+        
+        # Pool along height dimension: [B, C, H, W] -> [B, C, H, 1]
+        x_h = self.pool_h(x)
+        # Pool along width dimension: [B, C, H, W] -> [B, C, 1, W]
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)  # [B, C, W, 1]
+        
+        # Concatenate: [B, C, H+W, 1]
+        y = torch.cat([x_h, x_w], dim=2)
+        
+        # Shared feature encoding
+        y = self.act(self.bn(self.mip(y)))  # [B, C/r, H+W, 1]
+        
+        # Split back to horizontal and vertical
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)  # [B, C/r, 1, W]
+        
+        # Generate attention weights
+        a_h = self.sigmoid(self.conv_h(x_h))  # [B, C, H, 1]
+        a_w = self.sigmoid(self.conv_w(x_w))  # [B, C, 1, W]
+        
+        # Apply attention to input
+        out = identity * a_h * a_w
+        
+        return out
+
+
+# Alias for CoordinateAttention
+CA = CoordinateAttention
+
+
 class CBAM(nn.Module):
     """Convolutional Block Attention Module.
 

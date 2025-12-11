@@ -38,6 +38,7 @@ from ultralytics.nn.modules import (
     C3Ghost,
     C3k2,
     C3x,
+    CA,
     CBAM,
     CBFuse,
     CBLinear,
@@ -1655,6 +1656,14 @@ def parse_model(d, ch, verbose=True):
             c1 = ch[f]
             c2 = c1  # CBAM doesn't change channel number
             # CBAM(c1, kernel_size=7), if kernel_size not provided, use default 7
+            if len(args) == 0:
+                args = [c1]
+            else:
+                args = [c1, *args]
+        elif m is CA:
+            c1 = ch[f]
+            c2 = c1  # CA doesn't change channel number
+            # CA(c1, reduction=32), if reduction not provided, use default 32
             if len(args) == 0:
                 args = [c1]
             else:

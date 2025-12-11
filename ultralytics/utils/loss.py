@@ -489,7 +489,6 @@ class v8DetectionLoss:
         else:
             print("iou old")
             self.bbox_loss = BboxLoss(m.reg_max).to(device)
-            exit()
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
