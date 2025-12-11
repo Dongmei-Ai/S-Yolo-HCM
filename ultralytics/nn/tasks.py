@@ -38,6 +38,7 @@ from ultralytics.nn.modules import (
     C3Ghost,
     C3k2,
     C3x,
+    CBAM,
     CBFuse,
     CBLinear,
     Classify,
@@ -1650,6 +1651,14 @@ def parse_model(d, ch, verbose=True):
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
+        elif m is CBAM:
+            c1 = ch[f]
+            c2 = c1  # CBAM doesn't change channel number
+            # CBAM(c1, kernel_size=7), if kernel_size not provided, use default 7
+            if len(args) == 0:
+                args = [c1]
+            else:
+                args = [c1, *args]
         elif m in frozenset({TorchVision, Index}):
             c2 = args[0]
             c1 = ch[f]
