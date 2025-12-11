@@ -53,4 +53,4 @@ head:
   - [[18, 21, 24], 1, Detect, [nc]] # Detect(P3, P4, P5)
 
 loss:
-  iou_type: Iou
+  iou_type: Siou

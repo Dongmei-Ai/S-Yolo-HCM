@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import math
 
 import torch
 import torch.nn as nn
@@ -195,6 +196,138 @@ def bbox_wiou(
     r_wiou = (center_distance_sq / convex_diagonal_sq).exp()
     
     return iou, r_wiou
+
+
+def bbox_siou(
+    box1: torch.Tensor,
+    box2: torch.Tensor,
+    xywh: bool = False,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Calculate Scylla-IoU (SIoU) between bounding boxes.
+    
+    SIoU loss consists of 4 cost functions:
+    1. IoU cost
+    2. Angle cost
+    3. Distance cost
+    4. Shape cost
+    
+    Args:
+        box1 (torch.Tensor): Predicted bounding boxes, shape (N, 4) in xyxy format.
+        box2 (torch.Tensor): Ground truth bounding boxes, shape (N, 4) in xyxy format.
+        xywh (bool): If True, input boxes are in (x, y, w, h) format. If False, in (x1, y1, x2, y2) format.
+        eps (float): Small value to avoid division by zero.
+    
+    Returns:
+        torch.Tensor: SIoU values
+    
+    References:
+        https://arxiv.org/abs/2205.12740
+    """
+    # Get coordinates
+    if xywh:
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+        w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
+        b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
+        b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    
+    # Intersection area
+    inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp_(0) * (
+        b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)
+    ).clamp_(0)
+    
+    # Union area
+    union = w1 * h1 + w2 * h2 - inter + eps
+    
+    # IoU
+    iou = inter / union
+    
+    # Calculate center points
+    cx1 = (b1_x1 + b1_x2) / 2
+    cy1 = (b1_y1 + b1_y2) / 2
+    cx2 = (b2_x1 + b2_x2) / 2
+    cy2 = (b2_y1 + b2_y2) / 2
+    
+    # Calculate minimum enclosing box
+    cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex width
+    ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
+    c2 = cw.pow(2) + ch.pow(2) + eps  # convex diagonal squared
+    
+    # Center distance
+    rho2 = ((cx2 - cx1).pow(2) + (cy2 - cy1).pow(2)) / c2  # normalized center distance
+    
+    # Angle cost
+    # Calculate angle between boxes
+    sigma = torch.atan2((cy2 - cy1).abs(), (cx2 - cx1).abs() + eps)  # angle between centers
+    alpha = torch.atan2(h2, w2) - sigma  # angle difference
+    beta = torch.atan2(h1, w1) + sigma  # angle difference
+    
+    # Angle cost: Λ = 1 - 2 * sin²(min(α, β) - π/4)
+    # When α < π/4, use α; otherwise use β
+    angle_penalty = torch.minimum(alpha, beta)
+    angle_cost = 1 - 2 * torch.sin(angle_penalty - math.pi / 4).pow(2)
+    
+    # Distance cost
+    distance_cost = 2 - torch.exp(-angle_cost * rho2) - torch.exp(-angle_cost * (2 - rho2))
+    
+    # Shape cost
+    omega_w = (w2 - w1).abs() / (w2 + w1 + eps)
+    omega_h = (h2 - h1).abs() / (h2 + h1 + eps)
+    shape_cost = torch.pow(1 - torch.exp(-omega_w), 4) + torch.pow(1 - torch.exp(-omega_h), 4)
+    
+    # SIoU = IoU - (angle_cost + distance_cost + shape_cost) / 3
+    siou = iou - (angle_cost + distance_cost + shape_cost) / 3
+    
+    return siou
+
+
+class BboxSiouLoss(BboxLoss):
+    """Scylla-IoU Loss (SIoU).
+    
+    SIoU 损失函数通过引入角度成本、距离成本和形状成本来改进 IoU 损失，
+    能够更好地处理边界框回归问题，特别是在处理不同角度和形状的目标时。
+    
+    References:
+        https://arxiv.org/abs/2205.12740
+    """
+    
+    def __init__(self, reg_max: int = 16):
+        """Initialize the BboxSiouLoss module."""
+        super().__init__(reg_max)
+    
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute SIoU and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate SIoU
+        siou = bbox_siou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+        
+        # SIoU loss: L_SIoU = 1 - SIoU
+        loss_iou = ((1.0 - siou) * weight).sum() / target_scores_sum
+        
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+        
+        return loss_iou, loss_dfl
 
 
 class BboxWiouLossV1(BboxLoss):
@@ -480,6 +613,8 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         if loss_type == "Iou":
             self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        elif loss_type == "Siou":
+            self.bbox_loss = BboxSiouLoss(m.reg_max).to(device)
         elif loss_type == "WiouV1":
             self.bbox_loss = BboxWiouLoss(m.reg_max).to(device)
         elif loss_type == "WiouV2":
