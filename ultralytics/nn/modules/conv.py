@@ -634,40 +634,61 @@ class RepConv(nn.Module):
 
 
 class ChannelAttention(nn.Module):
-    """Channel-attention module for feature recalibration.
+    """Channel-attention module for feature recalibration (CBAM architecture).
 
-    Applies attention weights to channels based on global average pooling.
+    Applies attention weights to channels based on global average pooling and global max pooling.
+    Feature maps are processed through global max pooling and global average pooling separately,
+    then fed into a shared MLP. The MLP outputs are element-wise added and passed through
+    Sigmoid activation to generate the final channel attention feature map.
 
     Attributes:
-        pool (nn.AdaptiveAvgPool2d): Global average pooling.
-        fc (nn.Conv2d): Fully connected layer implemented as 1x1 convolution.
+        avg_pool (nn.AdaptiveAvgPool2d): Global average pooling.
+        max_pool (nn.AdaptiveMaxPool2d): Global max pooling.
+        mlp (nn.Sequential): Shared MLP implemented as 1x1 convolutions.
         act (nn.Sigmoid): Sigmoid activation for attention weights.
 
     References:
-        https://github.com/open-mmlab/mmdetection/tree/v3.0.0rc1/configs/rtmdet
+        CBAM: Convolutional Block Attention Module (ECCV 2018)
     """
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, reduction: int = 16) -> None:
         """Initialize Channel-attention module.
 
         Args:
             channels (int): Number of input channels.
+            reduction (int): Reduction ratio for MLP intermediate channels. Default is 16.
         """
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Conv2d(channels, channels, 1, 1, 0, bias=True)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # Shared MLP: two 1x1 convolutions with reduction
+        c_ = max(1, channels // reduction)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, c_, 1, 1, 0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c_, channels, 1, 1, 0, bias=False)
+        )
         self.act = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply channel attention to input tensor.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
 
         Returns:
-            (torch.Tensor): Channel-attended output tensor.
+            (torch.Tensor): Channel-attended output tensor of shape (B, C, H, W).
         """
-        return x * self.act(self.fc(self.pool(x)))
+        # Global average pooling and max pooling
+        avg_out = self.mlp(self.avg_pool(x))
+        max_out = self.mlp(self.max_pool(x))
+        
+        # Element-wise addition and Sigmoid activation
+        attention = self.act(avg_out + max_out)
+        
+        # Element-wise multiplication with input feature map
+        return x * attention
 
 
 class SpatialAttention(nn.Module):
