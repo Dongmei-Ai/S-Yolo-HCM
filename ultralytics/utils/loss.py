@@ -486,7 +486,7 @@ class BboxWiouLossV3(BboxLoss):
         beta = loss_iou_base / (self.iou_loss_avg + 1e-7)
         
         # Non-monotonic focusing factor: r = beta / (delta * alpha^(beta - delta))
-        r = beta / (self.delta * self.alpha.pow(beta - self.delta) + 1e-7)
+        r = beta / (self.delta * torch.pow(self.alpha, beta - self.delta) + 1e-7)
         
         # WIoUv3: L_WIoUv3 = r * L_WIoUv1
         loss_iou_v1 = r_wiou * loss_iou_base
