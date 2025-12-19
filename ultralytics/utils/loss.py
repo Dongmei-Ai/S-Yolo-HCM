@@ -193,7 +193,8 @@ def bbox_wiou(
     # R_WIoU: distance metric
     center_distance_sq = (cx1 - cx2).pow(2) + (cy1 - cy2).pow(2)
     convex_diagonal_sq = cw.pow(2) + ch.pow(2) + eps
-    r_wiou = (center_distance_sq / convex_diagonal_sq).exp()
+    # Important: detach l2_box (convex_diagonal_sq) to prevent gradient flow, following reference code
+    r_wiou = (center_distance_sq / convex_diagonal_sq.detach()).exp()
     
     return iou, r_wiou
 
@@ -384,18 +385,21 @@ class BboxWiouLossV2(BboxLoss):
         https://arxiv.org/abs/2301.10051
     """
     
-    def __init__(self, reg_max: int = 16, gamma: float = 1.5):
+    def __init__(self, reg_max: int = 16, gamma: float = 0.5, momentum: float = 0.01):
         """Initialize the BboxWiouLossV2 module.
         
         Args:
             reg_max: Maximum value for distribution focal loss.
             gamma: Focusing parameter for monotonic focusing mechanism.
+            momentum: Momentum for moving average update. Default: 0.05 (balanced between stability and responsiveness).
+                     Smaller values (e.g., 0.01) update slower but more stable.
+                     Larger values (e.g., 0.1) update faster but may be less stable.
         """
         super().__init__(reg_max)
         self.gamma = gamma
         # Moving average of IoU loss
         self.register_buffer('iou_loss_avg', torch.tensor(1.0))
-        self.momentum = 0.9
+        self.momentum = momentum  # Configurable momentum for flexibility
     
     def forward(
         self,
@@ -414,9 +418,14 @@ class BboxWiouLossV2(BboxLoss):
         iou, r_wiou = bbox_wiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
         loss_iou_base = 1.0 - iou  # L_IoU*
         
-        # Update moving average
+        # Update moving average (following reference code style for consistency)
         with torch.no_grad():
-            self.iou_loss_avg = self.momentum * self.iou_loss_avg + (1 - self.momentum) * loss_iou_base.mean()
+            # Reference code style: mul_(1 - momentum) then add_(momentum * new_value)
+            # This is mathematically equivalent but more consistent with V3 implementation
+            self.iou_loss_avg.mul_(1 - self.momentum)
+            self.iou_loss_avg.add_(self.momentum * loss_iou_base.detach().mean())
+            # Ensure iou_loss_avg is not too small to avoid numerical instability
+            self.iou_loss_avg.clamp_(min=1e-4)
         
         # Normalized IoU loss
         loss_iou_normalized = loss_iou_base / (self.iou_loss_avg + 1e-7)
@@ -446,20 +455,20 @@ class BboxWiouLossV3(BboxLoss):
         https://arxiv.org/abs/2301.10051
     """
     
-    def __init__(self, reg_max: int = 16, alpha: float = 1.0, delta: float = 1.6):
+    def __init__(self, reg_max: int = 16, alpha: float = 1.7, delta: float = 2.7):
         """Initialize the BboxWiouLossV3 module.
         
         Args:
             reg_max: Maximum value for distribution focal loss.
-            alpha: Hyperparameter for non-monotonic focusing mechanism.
-            delta: Hyperparameter for non-monotonic focusing mechanism.
+            alpha: Hyperparameter for non-monotonic focusing mechanism. Should be > 1.0. Default: 1.7
+            delta: Hyperparameter for non-monotonic focusing mechanism. Default: 2.7
         """
         super().__init__(reg_max)
         self.alpha = alpha
         self.delta = delta
         # Moving average of IoU loss
         self.register_buffer('iou_loss_avg', torch.tensor(1.0))
-        self.momentum = 0.9
+        self.momentum = 1e-2  # Use small momentum like reference code (0.01)
     
     def forward(
         self,
@@ -478,15 +487,22 @@ class BboxWiouLossV3(BboxLoss):
         iou, r_wiou = bbox_wiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
         loss_iou_base = 1.0 - iou  # L_IoU*
         
-        # Update moving average
+        # Update moving average (following reference code style)
         with torch.no_grad():
-            self.iou_loss_avg = self.momentum * self.iou_loss_avg + (1 - self.momentum) * loss_iou_base.mean()
+            # Reference code: self.iou_mean.mul_(1 - self.momentum).add_(self.momentum * iou.detach().mean())
+            # This is equivalent to: iou_mean = (1 - momentum) * iou_mean + momentum * iou_mean
+            self.iou_loss_avg.mul_(1 - self.momentum)
+            self.iou_loss_avg.add_(self.momentum * loss_iou_base.detach().mean())
+            # Ensure iou_loss_avg is not too small to avoid numerical instability
+            self.iou_loss_avg.clamp_(min=1e-4)
         
         # Anomaly coefficient: beta = L_IoU* / L_IoU_avg
         beta = loss_iou_base / (self.iou_loss_avg + 1e-7)
         
         # Non-monotonic focusing factor: r = beta / (delta * alpha^(beta - delta))
-        r = beta / (self.delta * torch.pow(self.alpha, beta - self.delta) + 1e-7)
+        # Following reference code: divisor = self.delta * torch.pow(self.alpha, beta - self.delta)
+        divisor = self.delta * torch.pow(self.alpha, beta - self.delta)
+        r = beta / (divisor + 1e-7)
         
         # WIoUv3: L_WIoUv3 = r * L_WIoUv1
         loss_iou_v1 = r_wiou * loss_iou_base
