@@ -1419,6 +1419,79 @@ class RandomHSV:
         return labels
 
 
+class RandomCLAHE:
+    """Apply Contrast Limited Adaptive Histogram Equalization (CLAHE) to an image with a given probability.
+
+    This class applies CLAHE augmentation to images, which enhances local contrast by applying histogram equalization
+    to small regions (tiles) of the image. This is useful for improving image quality in low-contrast scenarios.
+
+    Attributes:
+        p (float): Probability of applying CLAHE. Must be between 0 and 1.
+        clip_limit (float): Threshold for contrast limiting. Default is 2.0.
+        tile_grid_size (tuple[int, int]): Size of grid for histogram equalization. Default is (8, 8).
+
+    Methods:
+        __call__: Apply CLAHE to an image with the specified probability.
+
+    Examples:
+        >>> import numpy as np
+        >>> from ultralytics.data.augment import RandomCLAHE
+        >>> augmenter = RandomCLAHE(p=0.5, clip_limit=2.0, tile_grid_size=(8, 8))
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> labels = augmenter(labels)
+        >>> augmented_img = labels["img"]
+    """
+
+    def __init__(self, p: float = 0.0, clip_limit: float = 2.0, tile_grid_size: tuple[int, int] = (8, 8)) -> None:
+        """Initialize the RandomCLAHE object for CLAHE augmentation.
+
+        Args:
+            p (float): Probability of applying CLAHE. Should be in the range [0, 1].
+            clip_limit (float): Threshold for contrast limiting. Higher values increase contrast. Default is 2.0.
+            tile_grid_size (tuple[int, int]): Size of grid for histogram equalization as (rows, cols). Default is (8, 8).
+        """
+        self.p = p
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Apply CLAHE to an image with the specified probability.
+
+        This method applies Contrast Limited Adaptive Histogram Equalization to the input image if a random value
+        is less than the probability p. CLAHE enhances local contrast by applying histogram equalization to small
+        regions of the image.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image data and metadata. Must include an 'img' key with the
+                image as a numpy array in BGR format.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing the augmented image and adjusted labels.
+
+        Examples:
+            >>> clahe_augmenter = RandomCLAHE(p=0.5, clip_limit=2.0)
+            >>> labels = {"img": np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)}
+            >>> labels = clahe_augmenter(labels)
+            >>> augmented_img = labels["img"]
+        """
+        if self.p > 0.0 and random.random() < self.p:
+            img = labels["img"]
+            if img.shape[-1] == 3:  # only apply to RGB/BGR images
+                # Convert BGR to LAB color space
+                lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                
+                # Apply CLAHE to L channel
+                clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=self.tile_grid_size)
+                l = clahe.apply(l)
+                
+                # Merge channels and convert back to BGR
+                lab = cv2.merge([l, a, b])
+                cv2.cvtColor(lab, cv2.COLOR_LAB2BGR, dst=img)  # no return needed
+        return labels
+
+
 class RandomFlip:
     """Apply a random horizontal or vertical flip to an image with a given probability.
 
@@ -2397,6 +2470,12 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         >>> augmentations = [A.Blur(p=0.01), A.CLAHE(p=0.01)]
         >>> hyp.augmentations = augmentations
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
+        
+        >>> # With CLAHE augmentation
+        >>> hyp.clahe = 0.5  # probability of applying CLAHE
+        >>> hyp.clahe_clip_limit = 2.0  # contrast limit (optional, default=2.0)
+        >>> hyp.clahe_tile_grid_size = (8, 8)  # tile grid size (optional, default=(8,8))
+        >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
     """
     mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
     affine = RandomPerspective(
@@ -2429,6 +2508,14 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         elif flip_idx and (len(flip_idx) != kpt_shape[0]):
             raise ValueError(f"data.yaml flip_idx={flip_idx} length must be equal to kpt_shape[0]={kpt_shape[0]}")
 
+    # Get CLAHE parameters with defaults
+    clahe_p = getattr(hyp, "clahe", 0.0)  # probability of applying CLAHE
+    clahe_clip_limit = getattr(hyp, "clahe_clip_limit", 2.0)  # contrast limit
+    clahe_tile_grid_size = getattr(hyp, "clahe_tile_grid_size", (8, 8))  # tile grid size
+    # Convert list to tuple if needed (from YAML)
+    if isinstance(clahe_tile_grid_size, list):
+        clahe_tile_grid_size = tuple(clahe_tile_grid_size)
+    
     return Compose(
         [
             pre_transform,
@@ -2436,6 +2523,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
             Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+            RandomCLAHE(p=clahe_p, clip_limit=clahe_clip_limit, tile_grid_size=clahe_tile_grid_size),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
         ]
