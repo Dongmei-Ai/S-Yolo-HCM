@@ -203,6 +203,7 @@ class YOLODataset(BaseDataset):
             LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
         return labels
 
+    # 前处理核心章节，参数传入部分
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build and append transforms to the list.
 

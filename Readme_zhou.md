@@ -9,6 +9,7 @@
 相关的配置文件是default_cfg_yaml
 有一个 ultralytics/data/build.py 里面有一个 build_yolo_dataset 是核心
 数据增强相关的内容全部都在ultralytics/data/dataset.py的build_transforms之中
+关键词 前处理核心章节，参数传入部分
 
 
 # 损失计算部分
