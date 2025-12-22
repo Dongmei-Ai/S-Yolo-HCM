@@ -588,6 +588,83 @@ class RotatedBboxLoss(BboxLoss):
         return loss_iou, loss_dfl
 
 
+class BboxWeightedIouLoss(BboxLoss):
+    """Weighted IoU Loss with classification integration.
+    
+    本研究主要关注模型能否关注目标区域。IOU值低于0.3的缺陷区域被视为困难样本。
+    损失函数公式: Lwiou = wiou * qj * log(pj) + qk * log(pk)
+    
+    Attributes:
+        iou_threshold (float): IOU阈值，低于此值的样本被视为困难样本。默认0.3。
+        wiou_high (float): IOU >= threshold 时的权重。默认1.0。
+        wiou_low (float): IOU < threshold 时的权重。默认0.8（利用80%的简单样本）。
+    """
+    
+    def __init__(self, reg_max: int = 16, iou_threshold: float = 0.3, 
+                 wiou_high: float = 1.0, wiou_low: float = 0.8):
+        """Initialize the BboxWeightedIouLoss module.
+        
+        Args:
+            reg_max (int): Maximum value for DFL regularization.
+            iou_threshold (float): IOU阈值，低于此值的样本被视为困难样本。
+            wiou_high (float): IOU >= threshold 时的权重。
+            wiou_low (float): IOU < threshold 时的权重。
+        """
+        super().__init__(reg_max)
+        self.iou_threshold = iou_threshold
+        self.wiou_high = wiou_high
+        self.wiou_low = wiou_low
+    
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute weighted IoU and DFL losses for bounding boxes.
+        
+        Args:
+            pred_dist: 预测的分布张量
+            pred_bboxes: 预测的边界框
+            anchor_points: 锚点
+            target_bboxes: 目标边界框
+            target_scores: 目标分数（qj, qk）
+            target_scores_sum: 目标分数总和
+            fg_mask: 前景掩码
+            
+        Returns:
+            tuple: (loss_iou, loss_dfl) 加权IOU损失和DFL损失
+        """
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # 计算IOU
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        
+        # 根据IOU阈值确定wiou权重
+        # IOU >= threshold: 简单样本，使用wiou_high
+        # IOU < threshold: 困难样本，使用wiou_low
+        wiou = torch.where(iou >= self.iou_threshold, 
+                          torch.tensor(self.wiou_high, device=iou.device),
+                          torch.tensor(self.wiou_low, device=iou.device))
+        
+        # 加权IOU损失: wiou * (1 - iou)
+        loss_iou = (wiou.unsqueeze(-1) * (1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+        
+        return loss_iou, loss_dfl
+
+
 class KeypointLoss(nn.Module):
     """Criterion class for computing keypoint losses."""
 
@@ -637,9 +714,17 @@ class v8DetectionLoss:
             self.bbox_loss = BboxWiouLossV2(m.reg_max).to(device)
         elif loss_type == "WiouV3":
             self.bbox_loss = BboxWiouLossV3(m.reg_max).to(device)
+        elif loss_type == "WeightedIou" or loss_type == "WeightedIoU":
+            # 加权IOU损失，支持分类损失的加权
+            iou_threshold = getattr(h, "iou_threshold", 0.3)
+            wiou_high = getattr(h, "wiou_high", 1.0)
+            wiou_low = getattr(h, "wiou_low", 0.8)
+            self.bbox_loss = BboxWeightedIouLoss(m.reg_max, iou_threshold, wiou_high, wiou_low).to(device)
+            self.use_weighted_cls = True  # 标记使用加权分类损失
         else:
             print("iou old")
             self.bbox_loss = BboxLoss(m.reg_max).to(device)
+            self.use_weighted_cls = False
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -707,11 +792,7 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-
-        # Bbox loss
+        # Bbox loss (先计算，以便在分类损失中重用IOU)
         if fg_mask.sum():
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri,
@@ -722,6 +803,58 @@ class v8DetectionLoss:
                 target_scores_sum,
                 fg_mask,
             )
+            
+            # 如果使用加权分类损失，从bbox_loss中获取IOU（避免重复计算）
+            if getattr(self, "use_weighted_cls", False):
+                # 从bbox_loss中获取IOU（如果可用）
+                # 注意：由于bbox_loss中使用了缩放后的bboxes，我们需要重新计算
+                # 但可以使用更轻量的计算方式
+                pass  # 暂时保留原有计算方式，因为bboxes已经缩放
+
+        # Cls loss
+        if getattr(self, "use_weighted_cls", False) and fg_mask.sum():
+            # 加权分类损失: Lwiou = wiou * qj * log(pj) + qk * log(pk)
+            # 计算IOU来确定wiou权重（使用未缩放的bboxes）
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            iou_threshold = getattr(self.hyp, "iou_threshold", 0.3)
+            wiou_high = getattr(self.hyp, "wiou_high", 1.0)
+            wiou_low = getattr(self.hyp, "wiou_low", 0.8)
+            
+            # 根据IOU确定wiou权重（向量化操作）
+            # 确保iou是1维的，避免形状不匹配
+            iou = iou.squeeze() if iou.dim() > 1 else iou
+            wiou = torch.where(iou >= iou_threshold,
+                              torch.tensor(wiou_high, device=iou.device, dtype=dtype),
+                              torch.tensor(wiou_low, device=iou.device, dtype=dtype))
+            
+            # 确保wiou是1维的
+            wiou = wiou.squeeze() if wiou.dim() > 1 else wiou
+            
+            # 计算分类损失
+            target_scores_float = target_scores.to(dtype)
+            cls_loss_base = self.bce(pred_scores, target_scores_float)  # shape: (batch, anchors, classes)
+            
+            # 创建wiou权重张量，初始化为1.0（背景样本保持原权重）
+            batch_size, num_anchors = pred_scores.shape[:2]
+            wiou_expanded = torch.ones(batch_size, num_anchors, device=pred_scores.device, dtype=dtype)
+            
+            # 使用向量化操作将wiou权重应用到前景样本（避免循环，性能优化）
+            if fg_mask.numel() == batch_size * num_anchors:
+                fg_mask_2d = fg_mask.view(batch_size, num_anchors)
+                # 使用nonzero获取所有前景位置（向量化操作）
+                fg_indices = torch.nonzero(fg_mask_2d, as_tuple=False)  # shape: (num_fg, 2)
+                if len(fg_indices) == len(wiou):
+                    # 直接索引赋值，比循环快得多
+                    # 确保wiou是1维的，形状为(num_fg,)
+                    wiou_expanded[fg_indices[:, 0], fg_indices[:, 1]] = wiou.flatten()
+            
+            # 应用wiou权重到分类损失
+            cls_loss_weighted = cls_loss_base * wiou_expanded.unsqueeze(-1)
+            loss[1] = cls_loss_weighted.sum() / target_scores_sum
+        else:
+            # 标准BCE损失
+            # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+            loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
