@@ -485,6 +485,11 @@ class BboxWiouLossV3(BboxLoss):
         
         # Calculate WIoU
         iou, r_wiou = bbox_wiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+        
+        # 确保iou和r_wiou是1维的，避免形状不匹配问题
+        iou = iou.squeeze() if iou.dim() > 1 else iou
+        r_wiou = r_wiou.squeeze() if r_wiou.dim() > 1 else r_wiou
+        
         loss_iou_base = 1.0 - iou  # L_IoU*
         
         # Update moving average (following reference code style)
@@ -500,9 +505,18 @@ class BboxWiouLossV3(BboxLoss):
         beta = loss_iou_base / (self.iou_loss_avg + 1e-7)
         
         # Non-monotonic focusing factor: r = beta / (delta * alpha^(beta - delta))
-        # Following reference code: divisor = self.delta * torch.pow(self.alpha, beta - self.delta)
-        divisor = self.delta * torch.pow(self.alpha, beta - self.delta)
+        # 添加数值稳定性保护：限制指数范围，避免溢出或下溢
+        exp_arg = beta - self.delta
+        # 限制指数范围在合理区间内，避免数值溢出
+        exp_arg = exp_arg.clamp(min=-10.0, max=10.0)
+        divisor = self.delta * torch.pow(self.alpha, exp_arg)
         r = beta / (divisor + 1e-7)
+        
+        # 确保r的形状与loss_iou_base匹配（可能需要unsqueeze）
+        if r.dim() == 0:
+            r = r.unsqueeze(0)
+        if r.dim() < loss_iou_base.dim():
+            r = r.unsqueeze(-1)
         
         # WIoUv3: L_WIoUv3 = r * L_WIoUv1
         loss_iou_v1 = r_wiou * loss_iou_base
