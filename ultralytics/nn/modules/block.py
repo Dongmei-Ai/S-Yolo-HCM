@@ -31,11 +31,13 @@ __all__ = (
     "BNContrastiveHead",
     "Bottleneck",
     "BottleneckCSP",
+    "BottleneckCosAttn",
     "C2f",
     "C2fDWR",
     "C2fPKI",
     "C2fAttn",
     "C2fCIB",
+    "C2fCosAttn",
     "C2fPSA",
     "C3Ghost",
     "C3k2",
@@ -43,6 +45,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "CosineAttentionBlock",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -1712,6 +1715,184 @@ class C2PSA(nn.Module):
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
+
+
+class CosineAttentionBlock(nn.Module):
+    """Cosine Attention Block using cosine similarity for attention computation.
+    
+    This block computes attention weights using cosine similarity between query and key features,
+    which can help the model focus on relevant features more effectively.
+    
+    Attributes:
+        c (int): Number of input/output channels.
+        reduction (int): Channel reduction ratio for efficiency.
+        temperature (float): Temperature parameter for softmax scaling.
+    """
+    
+    def __init__(self, c: int, reduction: int = 4, temperature: float = 1.0):
+        """Initialize Cosine Attention Block.
+        
+        Args:
+            c (int): Number of input/output channels.
+            reduction (int): Channel reduction ratio. Default: 4.
+            temperature (float): Temperature parameter for attention scaling. Default: 1.0.
+        """
+        super().__init__()
+        self.c = c
+        self.reduction = reduction
+        self.temperature = temperature
+        self.c_red = max(c // reduction, 8)  # Reduced channels, minimum 8
+        
+        # Query, Key, Value projections
+        self.query_conv = Conv(c, self.c_red, 1, act=False)
+        self.key_conv = Conv(c, self.c_red, 1, act=False)
+        self.value_conv = Conv(c, c, 1, act=False)
+        
+        # Output projection
+        self.gamma = nn.Parameter(torch.zeros(1))  # Learnable scaling parameter
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through cosine attention block.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+            
+        Returns:
+            torch.Tensor: Output tensor with cosine attention applied.
+        """
+        B, C, H, W = x.shape
+        
+        # Generate query, key, value
+        query = self.query_conv(x)  # (B, c_red, H, W)
+        key = self.key_conv(x)      # (B, c_red, H, W)
+        value = self.value_conv(x)  # (B, C, H, W)
+        
+        # Reshape for attention computation: (B, c_red, H*W)
+        query = query.view(B, self.c_red, -1)  # (B, c_red, H*W)
+        key = key.view(B, self.c_red, -1)      # (B, c_red, H*W)
+        value = value.view(B, C, -1)           # (B, C, H*W)
+        
+        # Normalize for cosine similarity (L2 normalization)
+        query_norm = F.normalize(query, p=2, dim=1)  # (B, c_red, H*W)
+        key_norm = F.normalize(key, p=2, dim=1)      # (B, c_red, H*W)
+        
+        # Compute cosine similarity: (B, H*W, H*W)
+        # Cosine similarity = dot product of normalized vectors
+        attention = torch.bmm(query_norm.transpose(1, 2), key_norm)  # (B, H*W, H*W)
+        
+        # Scale by temperature and apply softmax
+        attention = attention / self.temperature
+        attention = F.softmax(attention, dim=-1)
+        
+        # Apply attention to values: (B, C, H*W)
+        out = torch.bmm(value, attention.transpose(1, 2))  # (B, C, H*W)
+        
+        # Reshape back to spatial dimensions
+        out = out.view(B, C, H, W)
+        
+        # Residual connection with learnable scaling
+        out = self.gamma * out + x
+        
+        return out
+
+
+class BottleneckCosAttn(nn.Module):
+    """Bottleneck block with cosine attention mechanism."""
+    
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, 
+        k: tuple[int, int] = (3, 3), e: float = 0.5, use_cos_attn: bool = True
+    ):
+        """Initialize bottleneck with cosine attention.
+        
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            g (int): Groups for convolutions.
+            k (tuple): Kernel sizes for convolutions.
+            e (float): Expansion ratio.
+            use_cos_attn (bool): Whether to use cosine attention. Default: True.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+        self.use_cos_attn = use_cos_attn
+        if use_cos_attn:
+            self.cos_attn = CosineAttentionBlock(c_, reduction=4)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bottleneck with optional cosine attention and shortcut."""
+        out = self.cv1(x)
+        if self.use_cos_attn:
+            out = self.cos_attn(out)
+        out = self.cv2(out)
+        return x + out if self.add else out
+
+
+class C2fCosAttn(nn.Module):
+    """C2f module with Cosine Attention mechanism.
+    
+    This module extends C2f by incorporating cosine attention blocks,
+    which use cosine similarity to compute attention weights for better feature representation.
+    
+    Attributes:
+        c (int): Hidden channels.
+        cv1 (Conv): First convolution layer.
+        cv2 (Conv): Second convolution layer.
+        m (nn.ModuleList): List of bottleneck blocks with cosine attention.
+    """
+    
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, 
+                 g: int = 1, e: float = 0.5, use_cos_attn: bool = True):
+        """Initialize C2f module with cosine attention.
+        
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+            use_cos_attn (bool): Whether to use cosine attention in bottlenecks. Default: True.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(
+            BottleneckCosAttn(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0, use_cos_attn=use_cos_attn) 
+            for _ in range(n)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2f layer with cosine attention.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+            
+        Returns:
+            torch.Tensor: Output tensor after processing.
+        """
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+    
+    def forward_split(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using split() instead of chunk().
+        
+        Args:
+            x (torch.Tensor): Input tensor.
+            
+        Returns:
+            torch.Tensor: Output tensor.
+        """
+        y = self.cv1(x).split((self.c, self.c), 1)
+        y = [y[0], y[1]]
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
 
 
 class C2fPSA(C2f):
