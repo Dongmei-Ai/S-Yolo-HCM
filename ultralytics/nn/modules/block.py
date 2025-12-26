@@ -1773,11 +1773,16 @@ class CosineAttentionBlock(nn.Module):
         value = value.view(B, C, -1)           # (B, C, H*W)
         
         # Normalize for cosine similarity (L2 normalization)
+        # 对每个空间位置的特征向量（dim=1，长度为c_red）进行L2归一化
+        # 归一化后的点积 = 余弦相似度 = (A·B) / (||A|| ||B||)
         query_norm = F.normalize(query, p=2, dim=1)  # (B, c_red, H*W)
         key_norm = F.normalize(key, p=2, dim=1)      # (B, c_red, H*W)
         
         # Compute cosine similarity: (B, H*W, H*W)
-        # Cosine similarity = dot product of normalized vectors
+        # 计算每个空间位置之间的余弦相似度（归一化后的点积）
+        # query_norm: (B, c_red, H*W) -> transpose -> (B, H*W, c_red)
+        # key_norm: (B, c_red, H*W)
+        # 结果: (B, H*W, H*W)，其中 attention[i, j] 是位置i和位置j之间的余弦相似度
         attention = torch.bmm(query_norm.transpose(1, 2), key_norm)  # (B, H*W, H*W)
         
         # Scale by temperature and apply softmax
