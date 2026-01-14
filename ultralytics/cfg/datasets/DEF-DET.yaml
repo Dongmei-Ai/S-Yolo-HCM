@@ -16,12 +16,12 @@ test: images/test # test images (optional)
 
 # Classes
 names:
-  0: Crazing
-  1: Inclusion
-  2: Patches
-  3: Pitted Surface
-  4: Rolled-in Scal
-  5: Scratches
+  0: Blowhole
+  1: crack
+  2: lack of fusion
+  3: other
+  4: slag inclusion
+  5: underpenetration
 
 
 # Download script/URL (optional)
